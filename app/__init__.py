@@ -1,0 +1,1 @@
+"""Chromaprint audio analyzer service."""

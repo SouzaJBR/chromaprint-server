@@ -1,0 +1,9 @@
+services:
+  audio-analyzer:
+    build: .
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    environment:
+      PORT: "${PORT:-8000}"
+      MAX_AUDIO_LENGTH_SECONDS: "3600"
+    restart: unless-stopped
