@@ -1,8 +1,11 @@
 import asyncio
+import io
 import os
+import subprocess
+import urllib.request
 from urllib.parse import urlparse
 
-import acoustid
+import av
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -12,11 +15,12 @@ from pydantic import BaseModel, HttpUrl
 load_dotenv()
 
 MAX_AUDIO_LENGTH_SECONDS = int(os.getenv("MAX_AUDIO_LENGTH_SECONDS", "3600"))
+FPCALC = os.environ.get("FPCALC", "fpcalc")
 
 app = FastAPI(
     title="Chromaprint Audio Analyzer",
     description="Generate a Chromaprint fingerprint and duration for audio at a URL.",
-    version="0.1.0",
+    version="0.3.0",
 )
 
 
@@ -26,7 +30,7 @@ class AnalyzeRequest(BaseModel):
 
 class AnalyzeResponse(BaseModel):
     duration: float
-    fingerprint: str
+    fingerprint: str | None = None
 
 
 class AnalysisError(Exception):
@@ -40,18 +44,55 @@ def server_port() -> int:
     return port
 
 
-def _fingerprint_url(url: str) -> tuple[float, bytes]:
-    """Pass a URL unchanged through pyacoustid's fpcalc backend.
+def _download_audio(url: str) -> bytes:
+    with urllib.request.urlopen(url, timeout=120) as response:
+        return response.read()
 
-    pyacoustid.fingerprint_file() calls os.path.abspath() on its argument,
-    which makes it unsuitable for URLs. This backend is the pyacoustid path
-    that preserves the URL and delegates retrieval and fingerprinting to
-    Chromaprint's fpcalc.
-    """
-    return acoustid._fingerprint_file_fpcalc(
-        url,
-        MAX_AUDIO_LENGTH_SECONDS
-    )
+
+def _compute_duration(audio_bytes: bytes) -> float:
+    try:
+        with av.open(io.BytesIO(audio_bytes)) as container:
+            streams = container.streams.audio
+            if not streams:
+                raise AnalysisError("No audio stream found")
+            stream = streams[0]
+            if stream.duration:
+                return float(stream.duration * stream.time_base)
+            if container.duration:
+                return float(container.duration) / 1_000_000
+            raise AnalysisError("Could not determine audio duration")
+    except av.AVError as exc:
+        raise AnalysisError(f"Unable to decode audio: {exc}") from exc
+
+
+def _compute_fingerprint(audio_bytes: bytes) -> str | None:
+    cmd = [FPCALC, "-length", str(MAX_AUDIO_LENGTH_SECONDS), "-"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=audio_bytes,
+            capture_output=True,
+            timeout=MAX_AUDIO_LENGTH_SECONDS + 60,
+        )
+    except FileNotFoundError as exc:
+        raise AnalysisError("fpcalc not found") from exc
+    except OSError as exc:
+        raise AnalysisError(f"fpcalc invocation failed: {exc}") from exc
+
+    if proc.returncode != 0:
+        return None
+
+    for line in proc.stdout.splitlines():
+        try:
+            parts = line.split(b"=", 1)
+        except ValueError:
+            continue
+        if parts[0] == b"FINGERPRINT":
+            try:
+                return parts[1].decode("ascii")
+            except UnicodeDecodeError:
+                return None
+    return None
 
 
 def analyze_url(url: str) -> AnalyzeResponse:
@@ -59,20 +100,14 @@ def analyze_url(url: str) -> AnalyzeResponse:
         raise AnalysisError("Only HTTP and HTTPS URLs are supported")
 
     try:
-        duration, fingerprint = _fingerprint_url(url)
-    except (
-        acoustid.FingerprintGenerationError,
-        acoustid.NoBackendError,
-        OSError,
-    ) as exc:
-        raise AnalysisError(f"Unable to analyze audio URL: {exc}") from exc
+        audio_bytes = _download_audio(url)
+    except Exception as exc:
+        raise AnalysisError(f"Unable to download audio: {exc}") from exc
 
-    try:
-        fingerprint_text = fingerprint.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise AnalysisError("pyacoustid returned an invalid fingerprint") from exc
+    duration = _compute_duration(audio_bytes)
+    fingerprint = _compute_fingerprint(audio_bytes)
 
-    return AnalyzeResponse(duration=duration, fingerprint=fingerprint_text)
+    return AnalyzeResponse(duration=duration, fingerprint=fingerprint)
 
 
 @app.get("/health")

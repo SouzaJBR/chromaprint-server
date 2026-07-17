@@ -1,10 +1,13 @@
 # Chromaprint Audio Analyzer API
 
 This service accepts an HTTP(S) audio URL and returns its duration and
-Chromaprint fingerprint. The application passes the URL to `pyacoustid`,
-which delegates retrieval and fingerprinting to Chromaprint. The service
-does not download or create a local audio file itself and does not use
-FFmpeg/libav directly.
+Chromaprint fingerprint. The application downloads the audio bytes into
+memory using the standard library, determines duration independently
+via PyAV (FFmpeg bindings), and passes the bytes to Chromaprint's
+`fpcalc` via stdin for fingerprinting. Duration and fingerprint
+computation are separate steps — if `fpcalc` fails (e.g. on very short
+audio), the response still includes the duration with `fingerprint:
+null`.
 
 ## Run with Docker Compose
 
@@ -30,6 +33,15 @@ Response:
 }
 ```
 
+For very short audio where a fingerprint cannot be generated:
+
+```json
+{
+  "duration": 0.5,
+  "fingerprint": null
+}
+```
+
 Interactive API documentation is available at <http://localhost:8000/docs>.
 The health endpoint is <http://localhost:8000/health>.
 
@@ -46,7 +58,7 @@ uv run python -m app.main
 
 Set `PORT` in `.env` to change both the application listen port and the Docker Compose host/container port. It defaults to `8000`.
 
-The host must provide Chromaprint's `fpcalc` backend. On Debian/Ubuntu:
+The host must provide Chromaprint's `fpcalc` binary. On Debian/Ubuntu:
 
 ```sh
 sudo apt-get install libchromaprint-tools
