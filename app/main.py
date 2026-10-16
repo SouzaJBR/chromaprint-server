@@ -2,7 +2,9 @@ import asyncio
 import io
 import os
 import subprocess
+import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import av
@@ -17,11 +19,23 @@ load_dotenv()
 MAX_AUDIO_LENGTH_SECONDS = int(os.getenv("MAX_AUDIO_LENGTH_SECONDS", "3600"))
 FPCALC = os.environ.get("FPCALC", "fpcalc")
 
+# Hard wall-clock budget for one /analyze request. Without this a single stuck
+# request keeps its worker forever and the server stops answering clients.
+ANALYZE_TIMEOUT = int(os.getenv("ANALYZE_TIMEOUT", "120"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "32"))
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "60"))
+MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(100 * 1024 * 1024)))
+FPCALC_TIMEOUT = int(os.getenv("FPCALC_TIMEOUT", "60"))
+
 app = FastAPI(
     title="Chromaprint Audio Analyzer",
     description="Generate a Chromaprint fingerprint and duration for audio at a URL.",
-    version="0.3.0",
+    version="0.2.0",
 )
+
+# Dedicated pool sized to MAX_CONCURRENCY so the number of threads uvicorn can
+# accept matches the number of requests it can actually run.
+_executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENCY, thread_name_prefix="analyze")
 
 
 class AnalyzeRequest(BaseModel):
@@ -44,9 +58,35 @@ def server_port() -> int:
     return port
 
 
+def _set_read_timeout(response: object, seconds: float) -> None:
+    # urllib exposes no total-download deadline; clamp the underlying socket so
+    # the next read cannot outlive the remaining budget.
+    raw = getattr(getattr(response, "fp", None), "raw", None)
+    sock = getattr(raw, "_sock", raw)
+    if hasattr(sock, "settimeout"):
+        sock.settimeout(seconds)
+
+
 def _download_audio(url: str) -> bytes:
-    with urllib.request.urlopen(url, timeout=120) as response:
-        return response.read()
+    deadline = time.monotonic() + DOWNLOAD_TIMEOUT
+    with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AnalysisError("Audio download timed out")
+            _set_read_timeout(response, remaining)
+            chunk = response.read(64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise AnalysisError(
+                    f"Audio download exceeds {MAX_DOWNLOAD_BYTES} bytes"
+                )
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _compute_duration(audio_bytes: bytes) -> float:
@@ -72,10 +112,12 @@ def _compute_fingerprint(audio_bytes: bytes) -> str | None:
             cmd,
             input=audio_bytes,
             capture_output=True,
-            timeout=MAX_AUDIO_LENGTH_SECONDS + 60,
+            timeout=FPCALC_TIMEOUT,
         )
     except FileNotFoundError as exc:
         raise AnalysisError("fpcalc not found") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AnalysisError("fpcalc timed out") from exc
     except OSError as exc:
         raise AnalysisError(f"fpcalc invocation failed: {exc}") from exc
 
@@ -117,11 +159,26 @@ def health() -> dict[str, str]:
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(request: AnalyzeRequest) -> AnalyzeResponse:
+    loop = asyncio.get_running_loop()
     try:
-        return await asyncio.to_thread(analyze_url, str(request.url))
+        return await asyncio.wait_for(
+            loop.run_in_executor(_executor, analyze_url, str(request.url)),
+            timeout=ANALYZE_TIMEOUT,
+        )
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504, detail="Analysis timed out"
+        ) from None
     except AnalysisError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=server_port())
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=server_port(),
+        # Backpressure: past capacity, answer 503 instead of accepting more
+        # connections that would only queue and never be answered.
+        limit_concurrency=MAX_CONCURRENCY,
+    )

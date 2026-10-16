@@ -1,3 +1,8 @@
+import subprocess
+import time
+import urllib.request
+
+import pytest
 from fastapi.testclient import TestClient
 
 from app import main
@@ -92,3 +97,76 @@ def test_analyze_url_passes_url_to_download(monkeypatch) -> None:
     assert captured == {"url": "https://samplelib.com/mp3/sample-15s.mp3"}
     assert result.duration == 15.047
     assert result.fingerprint == "AQAA-fp"
+
+
+def test_analyze_times_out_with_504(monkeypatch) -> None:
+    monkeypatch.setattr(main, "ANALYZE_TIMEOUT", 0.05)
+
+    def slow(_url: str) -> main.AnalyzeResponse:
+        time.sleep(0.5)
+        return main.AnalyzeResponse(duration=1.0)
+
+    monkeypatch.setattr(main, "analyze_url", slow)
+
+    response = client.post("/analyze", json={"url": "https://example.com/a.mp3"})
+
+    assert response.status_code == 504
+    assert response.json() == {"detail": "Analysis timed out"}
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes, chunk_delay: float = 0.0) -> None:
+        self._body = body
+        self._pos = 0
+        self._delay = chunk_delay
+
+    def __enter__(self) -> "_FakeHTTPResponse":
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+    def read(self, amt: int | None = None) -> bytes:
+        if self._delay:
+            time.sleep(self._delay)
+        if self._pos >= len(self._body):
+            return b""
+        if amt is None:
+            data = self._body[self._pos :]
+            self._pos = len(self._body)
+            return data
+        data = self._body[self._pos : self._pos + amt]
+        self._pos += len(data)
+        return data
+
+
+def test_download_rejects_oversized_body(monkeypatch) -> None:
+    monkeypatch.setattr(main, "MAX_DOWNLOAD_BYTES", 10)
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda *a, **k: _FakeHTTPResponse(b"x" * 100)
+    )
+
+    with pytest.raises(main.AnalysisError, match="exceeds"):
+        main._download_audio("https://example.com/a.mp3")
+
+
+def test_download_enforces_total_deadline(monkeypatch) -> None:
+    monkeypatch.setattr(main, "DOWNLOAD_TIMEOUT", 0.05)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *a, **k: _FakeHTTPResponse(b"x" * 100, chunk_delay=0.1),
+    )
+
+    with pytest.raises(main.AnalysisError, match="timed out"):
+        main._download_audio("https://example.com/a.mp3")
+
+
+def test_fpcalc_timeout_is_analysis_error(monkeypatch) -> None:
+    def boom(*_a: object, **_k: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="fpcalc", timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+
+    with pytest.raises(main.AnalysisError, match="timed out"):
+        main._compute_fingerprint(b"audio")
