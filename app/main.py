@@ -1,13 +1,12 @@
 import asyncio
-import io
 import os
 import subprocess
+import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
-import av
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -26,6 +25,9 @@ MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "32"))
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "60"))
 MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(100 * 1024 * 1024)))
 FPCALC_TIMEOUT = int(os.getenv("FPCALC_TIMEOUT", "60"))
+DECODE_TIMEOUT = int(os.getenv("DECODE_TIMEOUT", "30"))
+
+_DURATION_CMD = [sys.executable, "-m", "app.duration_worker"]
 
 app = FastAPI(
     title="Chromaprint Audio Analyzer",
@@ -90,19 +92,28 @@ def _download_audio(url: str) -> bytes:
 
 
 def _compute_duration(audio_bytes: bytes) -> float:
+    # Decode in a child process so an FFmpeg hang can be killed instead of
+    # pinning a worker thread (and the client's connection) forever.
     try:
-        with av.open(io.BytesIO(audio_bytes)) as container:
-            streams = container.streams.audio
-            if not streams:
-                raise AnalysisError("No audio stream found")
-            stream = streams[0]
-            if stream.duration:
-                return float(stream.duration * stream.time_base)
-            if container.duration:
-                return float(container.duration) / 1_000_000
-            raise AnalysisError("Could not determine audio duration")
-    except av.AVError as exc:
-        raise AnalysisError(f"Unable to decode audio: {exc}") from exc
+        proc = subprocess.run(
+            _DURATION_CMD,
+            input=audio_bytes,
+            capture_output=True,
+            timeout=DECODE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AnalysisError("Audio decode timed out") from exc
+    except OSError as exc:
+        raise AnalysisError(f"duration worker failed: {exc}") from exc
+
+    if proc.returncode != 0:
+        detail = proc.stderr.decode(errors="replace").strip()[:200]
+        raise AnalysisError(detail or "Unable to decode audio")
+
+    try:
+        return float(proc.stdout.decode("ascii").strip())
+    except ValueError as exc:
+        raise AnalysisError("Invalid duration from worker") from exc
 
 
 def _compute_fingerprint(audio_bytes: bytes) -> str | None:

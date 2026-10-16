@@ -170,3 +170,48 @@ def test_fpcalc_timeout_is_analysis_error(monkeypatch) -> None:
 
     with pytest.raises(main.AnalysisError, match="timed out"):
         main._compute_fingerprint(b"audio")
+
+
+def _wav_bytes(seconds: float, rate: int = 44100) -> bytes:
+    import io
+    import math
+    import struct
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        frames = b"".join(
+            struct.pack("<h", int(3000 * math.sin(2 * math.pi * 440 * i / rate)))
+            for i in range(int(rate * seconds))
+        )
+        w.writeframes(frames)
+    return buf.getvalue()
+
+
+def test_compute_duration_in_isolated_process() -> None:
+    assert main._compute_duration(_wav_bytes(0.5)) == pytest.approx(0.5, abs=0.01)
+
+
+def test_compute_duration_timeout_is_analysis_error(monkeypatch) -> None:
+    def boom(*_a: object, **_k: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="duration_worker", timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+
+    with pytest.raises(main.AnalysisError, match="decode timed out"):
+        main._compute_duration(b"audio")
+
+
+def test_compute_duration_worker_error_surfaces_stderr(monkeypatch) -> None:
+    class FakeProc:
+        returncode = 1
+        stdout = b""
+        stderr = b"No audio stream found\n"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeProc())
+
+    with pytest.raises(main.AnalysisError, match="No audio stream found"):
+        main._compute_duration(b"audio")
