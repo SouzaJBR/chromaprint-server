@@ -3,3 +3,6 @@
 .env
 __pycache__/
 *.py[cod]
+.coverage
+.idea/
+.ruff_cache/
