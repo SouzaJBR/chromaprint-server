@@ -32,7 +32,7 @@ _DURATION_CMD = [sys.executable, "-m", "app.duration_worker"]
 app = FastAPI(
     title="Chromaprint Audio Analyzer",
     description="Generate a Chromaprint fingerprint and duration for audio at a URL.",
-    version="0.2.0",
+    version="0.2.1",
 )
 
 # Dedicated pool sized to MAX_CONCURRENCY so the number of threads uvicorn can
